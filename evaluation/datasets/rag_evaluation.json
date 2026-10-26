@@ -1,0 +1,50 @@
+{
+  "dataset_name": "Enterprise RAG Evaluation",
+  "version": "1.0",
+  "created_at": "2026-10-26T20:43:12.880181+00:00",
+  "source_document": "IB PAPER.pdf",
+  "review_status": "pending_manual_verification",
+  "total_questions": 5,
+  "evaluation_cases": [
+    {
+      "id": "Q001",
+      "question": "What factors are investigated as drivers of impulsive buying on mobile apps?",
+      "reference_answer": "The study investigates physical environment, social environment, time perspective, hedonic browsing, and utilitarian browsing as situational factors associated with impulsive buying on mobile apps.",
+      "category": "research_variables",
+      "source_document": "IB PAPER.pdf",
+      "verified": false
+    },
+    {
+      "id": "Q002",
+      "question": "How many respondents participated in the research?",
+      "reference_answer": "The dataset contains responses from 628 respondents.",
+      "category": "dataset",
+      "source_document": "IB PAPER.pdf",
+      "verified": false
+    },
+    {
+      "id": "Q003",
+      "question": "What method was used to collect the research data?",
+      "reference_answer": "Data were collected using an online questionnaire administered to mobile device users who had made online purchases during the previous six months.",
+      "category": "methodology",
+      "source_document": "IB PAPER.pdf",
+      "verified": false
+    },
+    {
+      "id": "Q004",
+      "question": "Which statistical modelling approach was used in the study?",
+      "reference_answer": "The study used Structural Equation Modelling (SEM) to evaluate the empirical model.",
+      "category": "methodology",
+      "source_document": "IB PAPER.pdf",
+      "verified": false
+    },
+    {
+      "id": "Q005",
+      "question": "Does the article establish that the situational factors cause impulsive buying?",
+      "reference_answer": "The shared excerpts describe an empirical model and dataset but do not establish definitive causal effects. The proposed relationships should not be presented as proven causation.",
+      "category": "evidence_limitations",
+      "source_document": "IB PAPER.pdf",
+      "verified": false
+    }
+  ]
+}
