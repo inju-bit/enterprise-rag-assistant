@@ -1,39 +1,40 @@
-from pathlib import Path
 from functools import lru_cache
+from pathlib import Path
 from uuid import uuid4
-import hashlib
 
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = BASE_DIR / "chroma_data"
-MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 client = chromadb.PersistentClient(path=str(DB_PATH))
 
 collection = client.get_or_create_collection(
     name="enterprise_documents",
-    configuration={"hnsw": {"space": "cosine"}}
+    metadata={"hnsw:space": "cosine"}
 )
 
 
 @lru_cache(maxsize=1)
-def get_embedding_model():
-    return SentenceTransformer(MODEL_NAME, device="cpu")
+def embedding_model():
+    return SentenceTransformer(
+        "sentence-transformers/all-MiniLM-L6-v2",
+        device="cpu"
+    )
 
 
-def split_text(text, chunk_size=700, overlap=100):
-    if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
-        raise ValueError("Invalid chunk settings")
-
+def split_text(text, size=700, overlap=100):
     text = " ".join(text.split())
+
+    if not text:
+        return []
+
     chunks = []
     start = 0
 
     while start < len(text):
-        end = min(start + chunk_size, len(text))
+        end = min(start + size, len(text))
         chunks.append(text[start:end])
 
         if end == len(text):
@@ -44,151 +45,99 @@ def split_text(text, chunk_size=700, overlap=100):
     return chunks
 
 
-def store_document(filename, text):
+def delete_vectors(document_id):
+    existing = collection.get(
+        where={"document_id": document_id}
+    )
+
+    ids = existing.get("ids", [])
+
+    if ids:
+        collection.delete(ids=ids)
+
+    return len(ids)
+
+
+def index_document(document_id, filename, text):
     chunks = split_text(text)
 
     if not chunks:
-        return {
-            "document_id": None,
-            "chunks_stored": 0
-        }
+        raise ValueError("PDF has no extractable text.")
 
-    document_id = str(uuid4())
-    model = get_embedding_model()
+    # Remove any incomplete index from an earlier attempt.
+    delete_vectors(document_id)
 
-    embeddings = model.encode(
-        chunks,
-        convert_to_numpy=True
-    ).tolist()
+    batch_size = 32
 
-    # Remove previously indexed copies of this filename.
-    old = collection.get(
-        where={"filename": filename}
-    )
+    try:
+        for start in range(0, len(chunks), batch_size):
+            batch = chunks[start:start + batch_size]
 
-    if old["ids"]:
-        collection.delete(ids=old["ids"])
+            embeddings = embedding_model().encode(
+                batch,
+                convert_to_numpy=True
+            ).tolist()
 
-    ids = [
-        f"{document_id}_{i}"
-        for i in range(len(chunks))
-    ]
+            collection.add(
+                ids=[str(uuid4()) for _ in batch],
+                documents=batch,
+                embeddings=embeddings,
+                metadatas=[
+                    {
+                        "document_id": document_id,
+                        "filename": filename,
+                        "chunk_index": start + index
+                    }
+                    for index in range(len(batch))
+                ]
+            )
+    except Exception:
+        delete_vectors(document_id)
+        raise
 
-    metadatas = [
-        {
-            "filename": filename,
-            "document_id": document_id,
-            "chunk_index": i
-        }
-        for i in range(len(chunks))
-    ]
-
-    collection.add(
-        ids=ids,
-        documents=chunks,
-        embeddings=embeddings,
-        metadatas=metadatas
-    )
-
-    return {
-        "document_id": document_id,
-        "chunks_stored": len(chunks)
-    }
+    return len(chunks)
 
 
-def get_document_text():
-    """Return text of the indexed document if exactly one exists."""
-    stored = collection.get(
-        include=["documents", "metadatas"]
-    )
-
-    filenames = {
-        metadata["filename"]
-        for metadata in stored["metadatas"]
-    }
-
-    if not filenames:
-        return None
-
-    if len(filenames) > 1:
-        raise ValueError(
-            "Multiple PDFs are indexed. Please use a specific "
-            "question or keep only one PDF for summarisation."
-        )
-
-    filename = next(iter(filenames))
-
-    entries = sorted(
-        zip(stored["documents"], stored["metadatas"]),
-        key=lambda entry: entry[1].get("chunk_index", 0)
-    )
-
-    # Remove overlapping characters between consecutive chunks.
-    parts = []
-    previous = ""
-
-    for chunk, metadata in entries:
-        if parts and chunk == previous:
-            continue
-
-        if parts:
-            # Chunks from split_text overlap by 100 characters.
-            parts.append(chunk[100:])
-        else:
-            parts.append(chunk)
-
-        previous = chunk
-
-    return {
-        "filename": filename,
-        "text": "".join(parts)
-    }
-
-
-def search_documents(query, top_k=5):
-    if collection.count() == 0:
+def search_documents(query, top_k=5, document_id=None):
+    if not document_id:
         return []
 
-    model = get_embedding_model()
+    existing = collection.get(
+        where={"document_id": document_id}
+    )
 
-    embedding = model.encode(
+    count = len(existing.get("ids", []))
+
+    if count == 0:
+        return []
+
+    query_embedding = embedding_model().encode(
         [query],
         convert_to_numpy=True
     ).tolist()
 
     results = collection.query(
-        query_embeddings=embedding,
-        n_results=min(max(top_k * 4, 10), collection.count()),
+        query_embeddings=query_embedding,
+        n_results=min(top_k, count),
+        where={"document_id": document_id},
         include=["documents", "metadatas", "distances"]
     )
 
     matches = []
-    seen = set()
 
     for text, metadata, distance in zip(
         results["documents"][0],
         results["metadatas"][0],
         results["distances"][0]
     ):
-        content_hash = hashlib.sha256(
-            text.strip().encode("utf-8")
-        ).hexdigest()
-
-        if content_hash in seen:
-            continue
-
-        seen.add(content_hash)
-
         matches.append({
             "text": text,
-            "filename": metadata["filename"],
+            "filename": metadata.get("filename", "Document"),
+            "document_id": document_id,
             "similarity": round(
                 max(0, min(1, 1 - distance)),
                 4
             )
         })
-
-        if len(matches) >= top_k:
-            break
 
     return matches

@@ -1,181 +1,307 @@
-from datetime import datetime, timezone
+import logging
+import threading
+from pathlib import Path
+from uuid import uuid4
 
 from fastapi import (
-    FastAPI,
-    UploadFile,
-    File,
-    HTTPException
+    FastAPI, UploadFile, File, HTTPException, BackgroundTasks
 )
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from app.pdf_processor import extract_text_from_pdf
+from app.document_store import (
+    init_documents,
+    create_document,
+    get_document,
+    list_documents,
+    update_document,
+    remove_document,
+    UPLOAD_DIR
+)
 from app.vector_store import (
-    store_document,
+    index_document,
+    delete_vectors,
     search_documents
 )
 from app.rag import generate_answer
 
-from fastapi.middleware.cors import CORSMiddleware
-
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Enterprise AI Knowledge Assistant",
-    description="PDF-powered AI assistant with RAG",
-    version="1.3.0"
+    version="2.0.0"
 )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:5174",
-        "http://127.0.0.1:5174",
+        "http://127.0.0.1:5174"
     ],
-    allow_credentials=False,
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_methods=["GET", "POST", "DELETE"],
+    allow_headers=["*"]
 )
-MAX_FILE_SIZE = 10 * 1024 * 1024
+
+MAX_UPLOAD = 10 * 1024 * 1024
+
+# Protect indexing and deletion against concurrent modifications.
+index_lock = threading.RLock()
+
+init_documents()
 
 
-class QuestionRequest(BaseModel):
+class AskRequest(BaseModel):
     question: str = Field(min_length=1)
-    top_k: int = Field(default=3, ge=1, le=10)
+    document_id: str
+    top_k: int = Field(default=5, ge=1, le=20)
 
 
 class SearchRequest(BaseModel):
     query: str = Field(min_length=1)
-    top_k: int = Field(default=3, ge=1, le=20)
+    document_id: str
+    top_k: int = Field(default=5, ge=1, le=20)
+
+
+def public_document(document):
+    return {
+        "id": document["id"],
+        "filename": document["filename"],
+        "status": document["status"],
+        "pages": document["pages"],
+        "chunks": document["chunks"],
+        "error": document["error"],
+        "created_at": document["created_at"]
+    }
+
+
+def process_document(document_id):
+    # Serial execution prevents expensive embedding jobs
+    # from competing for the Intel Mac's CPU.
+    with index_lock:
+        document = get_document(document_id)
+
+        if not document:
+            return
+
+        try:
+            update_document(
+                document_id,
+                status="indexing",
+                error=None
+            )
+
+            path = Path(document["stored_path"])
+            content = path.read_bytes()
+
+            parsed = extract_text_from_pdf(content)
+
+            text = parsed["text"]
+            pages = parsed["total_pages"]
+
+            if not text.strip():
+                raise ValueError(
+                    "This PDF does not contain extractable text."
+                )
+
+            chunk_count = index_document(
+                document_id,
+                document["filename"],
+                text
+            )
+
+            update_document(
+                document_id,
+                status="ready",
+                pages=pages,
+                chunks=chunk_count,
+                error=None
+            )
+
+        except Exception as exc:
+            logger.exception(
+                "Failed to index document %s", document_id
+            )
+
+            delete_vectors(document_id)
+
+            update_document(
+                document_id,
+                status="failed",
+                error=str(exc)[:250]
+            )
 
 
 @app.get("/")
-def home():
+def root():
     return {
-        "application": "Enterprise AI Knowledge Assistant",
-        "status": "running",
-        "version": "1.3.0",
-        "features": [
-            "PDF upload",
-            "Semantic search",
-            "AI question answering"
-        ]
+        "name": "Enterprise AI Knowledge Assistant",
+        "version": "2.0.0",
+        "status": "running"
     }
 
 
 @app.get("/health")
-def health_check():
+def health():
+    return {"status": "healthy"}
+
+
+@app.get("/documents")
+def documents():
     return {
-        "status": "healthy",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "documents": [
+            public_document(doc)
+            for doc in list_documents()
+        ]
     }
 
 
-@app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    if (
-        not file.filename
-        or not file.filename.lower().endswith(".pdf")
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Only PDF files are allowed."
-        )
+@app.get("/documents/{document_id}")
+def document_detail(document_id: str):
+    doc = get_document(document_id)
 
-    pdf_bytes = await file.read(MAX_FILE_SIZE + 1)
-    await file.close()
+    if not doc:
+        raise HTTPException(404, "Document not found.")
 
-    if len(pdf_bytes) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail="PDF must be smaller than 10 MB."
-        )
+    return public_document(doc)
 
-    if not pdf_bytes.startswith(b"%PDF-"):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid PDF file."
-        )
+
+@app.post("/upload", status_code=202)
+async def upload(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    filename = Path(file.filename or "").name
+
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(400, "Only PDF files are supported.")
+
+    document_id = str(uuid4())
+    stored_path = UPLOAD_DIR / f"{document_id}.pdf"
+
+    total = 0
 
     try:
-        result = extract_text_from_pdf(pdf_bytes)
+        with stored_path.open("wb") as output:
+            while chunk := await file.read(1024 * 1024):
+                total += len(chunk)
+
+                if total > MAX_UPLOAD:
+                    raise HTTPException(
+                        413,
+                        "PDF exceeds the 10 MB limit."
+                    )
+
+                output.write(chunk)
+
+        with stored_path.open("rb") as stream:
+            if stream.read(5) != b"%PDF-":
+                raise HTTPException(400, "Invalid PDF file.")
+
+        create_document(
+            document_id,
+            filename,
+            stored_path
+        )
 
     except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Unable to read this PDF."
-        )
+        stored_path.unlink(missing_ok=True)
+        raise
 
-    if not result["text"].strip():
-        raise HTTPException(
-            status_code=422,
-            detail="No extractable text found in this PDF."
-        )
+    finally:
+        await file.close()
 
-    try:
-        stored = store_document(
-            filename=file.filename,
-            text=result["text"]
-        )
-
-    except Exception as exc:
-        print(f"Vector storage error: {exc}")
-
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to index the PDF."
-        )
+    background_tasks.add_task(
+        process_document,
+        document_id
+    )
 
     return {
-        "filename": file.filename,
-        "status": "success",
-        "total_pages": result["total_pages"],
-        "characters": len(result["text"]),
-        "document_id": stored["document_id"],
-        "chunks_stored": stored["chunks_stored"]
+        "status": "queued",
+        "document_id": document_id,
+        "filename": filename,
+        "message": "Upload complete. Indexing queued."
     }
+
+
+@app.delete("/documents/{document_id}")
+def delete_document(document_id: str):
+    # If indexing is in progress, this waits for that
+    # particular index operation to finish safely.
+    with index_lock:
+        document = get_document(document_id)
+
+        if not document:
+            raise HTTPException(404, "Document not found.")
+
+        try:
+            deleted_chunks = delete_vectors(document_id)
+
+            Path(document["stored_path"]).unlink(
+                missing_ok=True
+            )
+
+            remove_document(document_id)
+
+            return {
+                "status": "deleted",
+                "document_id": document_id,
+                "filename": document["filename"],
+                "deleted_chunks": deleted_chunks
+            }
+        except Exception:
+            logger.exception(
+                "Failed deleting document %s", document_id
+            )
+            raise HTTPException(
+                500,
+                "Failed to delete document."
+            )
 
 
 @app.post("/search")
 def search(request: SearchRequest):
-    try:
-        matches = search_documents(
-            query=request.query,
-            top_k=request.top_k
-        )
+    doc = get_document(request.document_id)
 
-    except Exception as exc:
-        print(f"Search error: {exc}")
+    if not doc:
+        raise HTTPException(404, "Document not found.")
 
-        raise HTTPException(
-            status_code=500,
-            detail="Document search failed."
-        )
+    if doc["status"] != "ready":
+        raise HTTPException(409, "Document is not ready.")
+
+    results = search_documents(
+        request.query,
+        request.top_k,
+        request.document_id
+    )
 
     return {
         "query": request.query,
-        "total_results": len(matches),
-        "results": matches
+        "results": results,
+        "total_results": len(results)
     }
 
 
 @app.post("/ask")
-def ask_question(request: QuestionRequest):
+def ask(request: AskRequest):
     try:
         return generate_answer(
             question=request.question,
-            top_k=request.top_k
+            top_k=request.top_k,
+            document_id=request.document_id
         )
+
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
     except RuntimeError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=str(exc)
-        )
+        raise HTTPException(503, str(exc))
 
-    except Exception as exc:
-        print(f"RAG error: {type(exc).__name__}: {exc}")
-
+    except Exception:
+        logger.exception("AI answer failed")
         raise HTTPException(
-            status_code=500,
-            detail="AI answer generation failed. Check the server logs."
+            500,
+            "Could not generate the answer."
         )
